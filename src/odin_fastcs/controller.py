@@ -7,6 +7,7 @@ parameters.
 
 Tim Nicholls, STFC Detector Systems Software Group
 """
+import json
 import logging
 from functools import partial
 from typing import Any, Dict, Sequence
@@ -19,6 +20,7 @@ from zmq.error import ZMQError
 
 from .client import FastCSClient
 from .types import ParamDict
+from .utils import denormalize_params, normalize_params, resolve_paths
 
 
 class FastCSControllerError(Exception):
@@ -239,6 +241,10 @@ class FastCSController:
                 logging.debug("Got get command from client %s", client_id)
                 response.set_params(self.process_client_get(client_id, client_msg))
 
+            case ("cmd", "set"):
+                logging.debug("Got set command from client %s", client_id)
+                response.set_params(self.process_client_set(client_id, client_msg))
+
             case ("cmd", "subscribe"):
                 logging.debug("Got subscribe command from client %s", client_id)
                 self.process_client_subscribe(client_id, client_msg)
@@ -284,32 +290,30 @@ class FastCSController:
         data = {}
 
         # Iterate through the requested paths
-        for path in paths:
-            # Resolve the adapter and subpath from the requested path
-            split_path = path.split("/", 1)
-            adapter = split_path[0]
-            sub_path = split_path[1] if len(split_path) > 1 else ""
-
-            # Create a request object to pass to adapters
-            request = ApiAdapterRequest(None)
-
-            # If the client wants parameter metadata, add the appropriate qualifier to the
-            # response type, i.e. the Accept header field in the request
-            if with_metadata:
-                request.set_response_type(request.response_type + ";metadata=true")
+        for path, adapter, sub_path in resolve_paths(paths):
 
             # If the adapter is present in the application, request the appropriate data from it
             if adapter in self.adapters:
+
+                # Create a request object to pass to the adapter
+                request = ApiAdapterRequest(None)
+
+                # If the client wants parameter metadata, add the appropriate qualifier to the
+                # response type, i.e. the Accept header field in the request
+                if with_metadata:
+                    request.set_response_type(request.response_type + ";metadata=true")
+
+                # Call the get method of the adapter with the subpath and request
                 adapter_response = self.adapters[adapter].get(sub_path, request)
                 logging.debug(
-                    "Got response from adapter %s path %s: %s",
+                    "Got response from adapter %s GET at path %s: %s",
                     adapter,
                     sub_path,
                     adapter_response.data,
                 )
 
-                # Prune the data returned from the adapter to normalise the paths
-                params = self._prune_params(sub_path, adapter_response.data)
+                # Normalize the paths of data returned from the adapter
+                params = normalize_params(sub_path, adapter_response.data)
 
                 # Update the parameter cache in the client and add to the returned data
                 data[path] = self.clients[client_id].update_params(path, params, with_delta)
@@ -317,31 +321,49 @@ class FastCSController:
         # Return the requested parameter data
         return data
 
-    @staticmethod
-    def _prune_params(path: str, params: ParamDict) -> ParamDict:
-        """Prune parameters returned by adapters.
+    def process_client_set(self, client_id: str, client_msg: IpcMessage) -> ParamDict:
+        """Process a client set command.
 
-        Adapter parameter tree get calls return leaf nodes as a key-value pair, i.e. path
-        /a/b/c will return {"c": value}. To regularize the data returned to the client for
-        such paths, prune the key from the parameter data and replace it with just the value.
+        This method processes a set command from a client. The parameter payload of the client
+        message should be a dictionary of valid paths and values to set in adapters loaded into
+        the system.
 
-        :param path: path to the parameter to prune
-        :param params: parameter(s) to prune
-        :return: pruned parameter(s)
+        :param client_id: client ID string
+        :param client_msg: client IPC message for the set command
+        :return: repsonse to the client
         """
-        if len(param_keys := list(params.keys())) == 1:
-            if (key := param_keys[0]) == path.split("/")[-1]:
-                params = params[key]
+        paths = client_msg.get_param("paths", {})
 
-        return params
+        data = {}
+
+        # Iterate through the requested paths
+        for path, adapter, sub_path in resolve_paths(paths.keys()):
+
+            if adapter in self.adapters:
+
+                request_path, param_name, params = denormalize_params(sub_path, paths[path])
+
+                request = ApiAdapterRequest(json.dumps(params))
+
+                adapter_response = self.adapters[adapter].put(request_path, request)
+                logging.debug(
+                    "Got response from adapter %s PUT at path %s: %s",
+                    adapter,
+                    request_path,
+                    adapter_response.data,
+                )
+
+                data[path] = adapter_response.data[request_path][param_name]
+
+        return data
 
     def process_client_subscribe(self, client_id: str, client_msg: IpcMessage) -> ParamDict:
         """Process a client subscribe command.
 
-        This method processes a subscribe command from a client,
+        This method processes a subscribe command from a client.
         :param client_id: client ID string
         :param client_msg: client IPC message for the get command
-        :returns response to client
+        :return: response to client
         """
         paths = client_msg.get_param("paths", [])
         logging.debug("Client %s wants to subscribe to paths: %s", client_id, ",".join(paths))
