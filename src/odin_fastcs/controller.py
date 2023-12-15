@@ -330,21 +330,27 @@ class FastCSController:
 
         :param client_id: client ID string
         :param client_msg: client IPC message for the set command
-        :return: repsonse to the client
+        :return: dictionary of modified parameter paths and values
         """
+        # Extract the list of parameter paths and values from the client message
         paths = client_msg.get_param("paths", {})
 
+        # Create an empty dictionary of modified parameters to return
         data = {}
 
         # Iterate through the requested paths
         for path, adapter, sub_path in resolve_paths(paths.keys()):
 
+            # If the adapter is present in the application, send the appropriate data to it
             if adapter in self.adapters:
 
+                # Denormalize leaf node parameters into the correct format for adapters
                 request_path, param_name, params = denormalize_params(sub_path, paths[path])
 
+                # Build a request with the parameter data in the body
                 request = ApiAdapterRequest(json.dumps(params))
 
+                # Call the put method of the adapter with the request path and request data
                 adapter_response = self.adapters[adapter].put(request_path, request)
                 logging.debug(
                     "Got response from adapter %s PUT at path %s: %s",
@@ -353,8 +359,10 @@ class FastCSController:
                     adapter_response.data,
                 )
 
+                # Add the modified parameters response to the returned data
                 data[path] = adapter_response.data[request_path][param_name]
 
+        # Return the modified parameter data
         return data
 
     def process_client_subscribe(self, client_id: str, client_msg: IpcMessage) -> ParamDict:
